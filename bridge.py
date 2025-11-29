@@ -1,62 +1,96 @@
-import meshtastic.serial_interface
-import pubsub
-import time
 import datetime
+import time
 from collections import deque
 
-backbone = meshtastic.serial_interface.SerialInterface(devPath='COM12')
-regional = meshtastic.serial_interface.SerialInterface(devPath='COM13')
+import pubsub
+import meshtastic.serial_interface
+
+BACKBONE_DEV = "COM12"
+REGIONAL_DEV = "COM13"
+
+backbone = meshtastic.serial_interface.SerialInterface(devPath=BACKBONE_DEV)
+regional = meshtastic.serial_interface.SerialInterface(devPath=REGIONAL_DEV)
 
 seen_packets = deque(maxlen=200)
 
-def pretty_print_packet(packet, source_label):
+ALLOWED_PORTNUMS = {"TEXT_MESSAGE_APP", "NODEINFO_APP", "ROUTING_APP"}
+
+
+def pretty_print_packet(packet, origin_mesh, destination_mesh):
     headers = {
-        "Source": source_label,
+        "Origin Mesh": origin_mesh,
+        "Destination Mesh": destination_mesh,
         "From": packet.get("fromId"),
         "To": packet.get("toId"),
         "HopLimit": packet.get("hopLimit"),
-        "RxTime": datetime.datetime.fromtimestamp(packet.get("rxTime", 0)).isoformat()
+        "RxTime": datetime.datetime.fromtimestamp(packet.get("rxTime", 0)).isoformat(),
     }
-    text = packet.get("decoded", {}).get("text")
 
-    print("\n--- Packet ---")    
+    print("\n--- Packet ---")
+    for k, v in headers.items():
+        print(f"{k}: {v}")
+
+    decoded = packet.get("decoded", {})
+    text = decoded.get("text")
+    payload = decoded.get("payload")
+    portnum = decoded.get("portnum")
+
+    print(f"PortNum: {portnum}")
     if text:
-        for k, v in headers.items():
-            print(f"{k}: {v}")
-        print(f"Message: {text}")
+        print(f"Text: {text}")
+    elif payload:
+        print(f"Payload (raw): {payload}")
     else:
-        print("Non‑text packet ignored")
+        print("No text or payload field present")
+
+    print(f"Decoded dict: {decoded}")
+    print(f"Packet keys: {list(packet.keys())}")
     print("--------------\n")
+
 
 def should_forward(packet):
     pkt_id = packet.get("id") or f"{packet.get('fromId')}-{packet.get('rxTime')}"
     if pkt_id in seen_packets:
         return False
     seen_packets.append(pkt_id)
-    return True
+
+    portnum = packet.get("decoded", {}).get("portnum")
+    return portnum in ALLOWED_PORTNUMS
+
+
+def handle_packet(packet, interface, origin_mesh, destination_mesh, sender, receiver):
+    if getattr(interface, "devPath", None) != sender.devPath:
+        return
+
+    if not should_forward(packet):
+        return
+
+    decoded = packet.get("decoded", {})
+    text = decoded.get("text")
+    payload = decoded.get("payload")
+    portnum = decoded.get("portnum")
+    dest = packet.get("toId")
+
+    pretty_print_packet(packet, origin_mesh, destination_mesh)
+
+    if text and dest:
+        receiver.sendText(text, destinationId=dest)
+    elif payload and dest:
+        receiver.sendData(payload, destinationId=dest, portNum=portnum)
+
 
 def on_backbone(packet, interface):
-    if interface != backbone:
-        return  # ignore packets not from backbone
-    pretty_print_packet(packet, "Backbone")
-    text = packet.get("decoded", {}).get("text")
-    if text and should_forward(packet):
-        regional.sendText(text, destinationId="^all")
+    handle_packet(packet, interface, "Backbone", "Regional", backbone, regional)
+
 
 def on_regional(packet, interface):
-    if interface != regional:
-        return  # ignore packets not from regional
-    pretty_print_packet(packet, "Regional")
-    text = packet.get("decoded", {}).get("text")
-    if text and should_forward(packet):
-        backbone.sendText(text, destinationId="^all")
+    handle_packet(packet, interface, "Regional", "Backbone", regional, backbone)
 
-# Subscribe to backbone node events
-pubsub.pub.subscribe(on_backbone, f"meshtastic.receive")
 
-# Subscribe to regional node events
-pubsub.pub.subscribe(on_regional, f"meshtastic.receive")
+# Subscribe to events
+pubsub.pub.subscribe(on_backbone, "meshtastic.receive")
+pubsub.pub.subscribe(on_regional, "meshtastic.receive")
 
-print("Bridge running with deduplication... press Ctrl+C to stop")
+print("Bridge running... press Ctrl+C to stop")
 while True:
     time.sleep(1)
